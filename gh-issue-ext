@@ -1,0 +1,1042 @@
+#!/usr/bin/env bash
+# gh-issue-ext - GitHub CLI extension for advanced issue management
+# Provides sub-issues, blocking relationships, and linked branch management
+#
+# Usage: gh issue-ext <command> <subcommand> [arguments]
+#
+# Commands:
+#   sub       Manage sub-issue relationships
+#   blocking  Manage blocking/blocked-by relationships
+#   branch    Manage linked development branches
+#   show      Show all relationships for an issue
+
+set -euo pipefail
+
+VERSION="1.0.0"
+GRAPHQL_FEATURES_HEADER="GraphQL-Features: sub_issues"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Print colored output
+info() { echo -e "${BLUE}$*${NC}"; }
+success() { echo -e "${GREEN}$*${NC}"; }
+warn() { echo -e "${YELLOW}$*${NC}"; }
+error() { echo -e "${RED}Error: $*${NC}" >&2; }
+
+# Print usage information
+usage() {
+    cat << 'EOF'
+gh issue-ext - Advanced GitHub issue management
+
+USAGE
+  gh issue-ext <command> <subcommand> [arguments]
+
+COMMANDS
+  sub       Manage sub-issue (parent/child) relationships
+  blocking  Manage blocking/blocked-by relationships
+  branch    Manage linked development branches
+  show      Display all relationships for an issue
+
+SUB-ISSUE COMMANDS
+  gh issue-ext sub add <parent> <child>
+      Add an existing issue as a sub-issue of a parent
+
+  gh issue-ext sub remove <parent> <child>
+      Remove the parent-child relationship
+
+  gh issue-ext sub list <issue>
+      List all sub-issues of an issue
+
+  gh issue-ext sub reorder <parent> <child> --after <sibling>
+  gh issue-ext sub reorder <parent> <child> --before <sibling>
+      Change the position of a sub-issue in the list
+
+BLOCKING COMMANDS
+  gh issue-ext blocking add <blocked> <blocker>
+      Mark <blocked> issue as blocked by <blocker> issue
+
+  gh issue-ext blocking remove <blocked> <blocker>
+      Remove the blocking relationship
+
+  gh issue-ext blocking list <issue>
+      Show what blocks this issue and what it blocks
+
+BRANCH COMMANDS
+  gh issue-ext branch create <issue> [--name <branch-name>]
+      Create a development branch linked to the issue
+
+  gh issue-ext branch delete <issue> <branch-name>
+      Unlink and optionally delete a branch from the issue
+
+  gh issue-ext branch list <issue>
+      List all branches linked to the issue
+
+SHOW COMMAND
+  gh issue-ext show <issue>
+      Display all relationships (parent, sub-issues, blocking, branches)
+
+ARGUMENTS
+  <issue>    Issue number (e.g., 123) or URL (e.g., owner/repo#123)
+  <parent>   Parent issue number or URL
+  <child>    Child issue number or URL
+  <blocked>  Issue that is blocked
+  <blocker>  Issue that is blocking
+
+FLAGS
+  --help, -h     Show this help message
+  --version, -v  Show version information
+  --json         Output in JSON format (where applicable)
+
+EXAMPLES
+  # Add issue #42 as a sub-issue of epic #10
+  gh issue-ext sub add 10 42
+
+  # Mark issue #15 as blocked by issue #14
+  gh issue-ext blocking add 15 14
+
+  # Create a development branch for issue #42
+  gh issue-ext branch create 42 --name feature/user-auth
+
+  # Show all relationships for issue #10
+  gh issue-ext show 10
+EOF
+}
+
+# Get issue node ID from issue number
+# Arguments: issue_ref (number or owner/repo#number)
+get_issue_id() {
+    local issue_ref="$1"
+    local result
+
+    result=$(gh issue view "$issue_ref" --json id --jq '.id' 2>/dev/null) || {
+        error "Could not find issue: $issue_ref"
+        return 1
+    }
+    echo "$result"
+}
+
+# Get repository node ID
+get_repo_id() {
+    local result
+    result=$(gh repo view --json id --jq '.id' 2>/dev/null) || {
+        error "Could not get repository ID"
+        return 1
+    }
+    echo "$result"
+}
+
+# Get default branch SHA
+get_default_branch_sha() {
+    local result
+    result=$(gh api graphql -f query='
+        query {
+            repository(owner: "{owner}", name: "{repo}") {
+                defaultBranchRef {
+                    target { oid }
+                }
+            }
+        }
+    ' --jq '.data.repository.defaultBranchRef.target.oid' 2>/dev/null)
+
+    # If that doesn't work, try getting it from the current repo context
+    if [[ -z "$result" || "$result" == "null" ]]; then
+        result=$(gh api graphql -f query="$(cat << 'QUERY'
+            query($owner: String!, $repo: String!) {
+                repository(owner: $owner, name: $repo) {
+                    defaultBranchRef {
+                        target { oid }
+                    }
+                }
+            }
+QUERY
+        )" -f owner="$(gh repo view --json owner --jq '.owner.login')" \
+           -f repo="$(gh repo view --json name --jq '.name')" \
+           --jq '.data.repository.defaultBranchRef.target.oid' 2>/dev/null) || {
+            error "Could not get default branch SHA"
+            return 1
+        }
+    fi
+    echo "$result"
+}
+
+# ============================================================================
+# SUB-ISSUE COMMANDS
+# ============================================================================
+
+sub_add() {
+    local parent_ref="$1"
+    local child_ref="$2"
+
+    info "Adding sub-issue relationship..."
+
+    local parent_id child_id
+    parent_id=$(get_issue_id "$parent_ref") || return 1
+    child_id=$(get_issue_id "$child_ref") || return 1
+
+    local result
+    result=$(gh api graphql \
+        -H "$GRAPHQL_FEATURES_HEADER" \
+        -f query="$(cat << 'QUERY'
+            mutation($parentId: ID!, $childId: ID!) {
+                addSubIssue(input: { issueId: $parentId, subIssueId: $childId }) {
+                    issue { title number }
+                    subIssue { title number }
+                }
+            }
+QUERY
+        )" \
+        -f parentId="$parent_id" \
+        -f childId="$child_id" \
+        2>&1) || {
+        error "Failed to add sub-issue: $result"
+        return 1
+    }
+
+    local parent_title child_title parent_num child_num
+    parent_title=$(echo "$result" | jq -r '.data.addSubIssue.issue.title')
+    parent_num=$(echo "$result" | jq -r '.data.addSubIssue.issue.number')
+    child_title=$(echo "$result" | jq -r '.data.addSubIssue.subIssue.title')
+    child_num=$(echo "$result" | jq -r '.data.addSubIssue.subIssue.number')
+
+    success "Added #$child_num ($child_title) as sub-issue of #$parent_num ($parent_title)"
+}
+
+sub_remove() {
+    local parent_ref="$1"
+    local child_ref="$2"
+
+    info "Removing sub-issue relationship..."
+
+    local parent_id child_id
+    parent_id=$(get_issue_id "$parent_ref") || return 1
+    child_id=$(get_issue_id "$child_ref") || return 1
+
+    local result
+    result=$(gh api graphql \
+        -H "$GRAPHQL_FEATURES_HEADER" \
+        -f query="$(cat << 'QUERY'
+            mutation($parentId: ID!, $childId: ID!) {
+                removeSubIssue(input: { issueId: $parentId, subIssueId: $childId }) {
+                    issue { title number }
+                    subIssue { title number }
+                }
+            }
+QUERY
+        )" \
+        -f parentId="$parent_id" \
+        -f childId="$child_id" \
+        2>&1) || {
+        error "Failed to remove sub-issue: $result"
+        return 1
+    }
+
+    success "Removed sub-issue relationship"
+}
+
+sub_list() {
+    local issue_ref="$1"
+    local json_output="${2:-false}"
+
+    local issue_id
+    issue_id=$(get_issue_id "$issue_ref") || return 1
+
+    local result
+    result=$(gh api graphql \
+        -H "$GRAPHQL_FEATURES_HEADER" \
+        -f query="$(cat << 'QUERY'
+            query($issueId: ID!) {
+                node(id: $issueId) {
+                    ... on Issue {
+                        title
+                        number
+                        subIssues(first: 50) {
+                            totalCount
+                            nodes {
+                                number
+                                title
+                                state
+                                url
+                            }
+                        }
+                    }
+                }
+            }
+QUERY
+        )" \
+        -f issueId="$issue_id" \
+        2>&1) || {
+        error "Failed to list sub-issues: $result"
+        return 1
+    }
+
+    if [[ "$json_output" == "true" ]]; then
+        echo "$result" | jq '.data.node'
+        return 0
+    fi
+
+    local title num count
+    title=$(echo "$result" | jq -r '.data.node.title')
+    num=$(echo "$result" | jq -r '.data.node.number')
+    count=$(echo "$result" | jq -r '.data.node.subIssues.totalCount')
+
+    echo ""
+    echo "Sub-issues of #$num: $title"
+    echo "Total: $count"
+    echo ""
+
+    if [[ "$count" -eq 0 ]]; then
+        echo "  (no sub-issues)"
+    else
+        echo "$result" | jq -r '.data.node.subIssues.nodes[] | "  #\(.number) [\(.state)] \(.title)"'
+    fi
+}
+
+sub_reorder() {
+    local parent_ref="$1"
+    local child_ref="$2"
+    shift 2
+
+    local position_type=""
+    local sibling_ref=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --after)
+                position_type="after"
+                sibling_ref="$2"
+                shift 2
+                ;;
+            --before)
+                position_type="before"
+                sibling_ref="$2"
+                shift 2
+                ;;
+            *)
+                error "Unknown option: $1"
+                return 1
+                ;;
+        esac
+    done
+
+    if [[ -z "$position_type" || -z "$sibling_ref" ]]; then
+        error "Must specify --after or --before with a sibling issue"
+        return 1
+    fi
+
+    info "Reordering sub-issue..."
+
+    local parent_id child_id sibling_id
+    parent_id=$(get_issue_id "$parent_ref") || return 1
+    child_id=$(get_issue_id "$child_ref") || return 1
+    sibling_id=$(get_issue_id "$sibling_ref") || return 1
+
+    local query
+    if [[ "$position_type" == "after" ]]; then
+        query="$(cat << 'QUERY'
+            mutation($parentId: ID!, $childId: ID!, $siblingId: ID!) {
+                reprioritizeSubIssue(input: {
+                    issueId: $parentId,
+                    subIssueId: $childId,
+                    afterId: $siblingId
+                }) {
+                    issue { title number }
+                }
+            }
+QUERY
+        )"
+    else
+        query="$(cat << 'QUERY'
+            mutation($parentId: ID!, $childId: ID!, $siblingId: ID!) {
+                reprioritizeSubIssue(input: {
+                    issueId: $parentId,
+                    subIssueId: $childId,
+                    beforeId: $siblingId
+                }) {
+                    issue { title number }
+                }
+            }
+QUERY
+        )"
+    fi
+
+    local result
+    result=$(gh api graphql \
+        -H "$GRAPHQL_FEATURES_HEADER" \
+        -f query="$query" \
+        -f parentId="$parent_id" \
+        -f childId="$child_id" \
+        -f siblingId="$sibling_id" \
+        2>&1) || {
+        error "Failed to reorder sub-issue: $result"
+        return 1
+    }
+
+    success "Reordered sub-issue $position_type sibling"
+}
+
+# ============================================================================
+# BLOCKING COMMANDS
+# ============================================================================
+
+blocking_add() {
+    local blocked_ref="$1"
+    local blocker_ref="$2"
+
+    info "Adding blocking relationship..."
+
+    local blocked_id blocker_id
+    blocked_id=$(get_issue_id "$blocked_ref") || return 1
+    blocker_id=$(get_issue_id "$blocker_ref") || return 1
+
+    local result
+    result=$(gh api graphql \
+        -f query="$(cat << 'QUERY'
+            mutation($blockedId: ID!, $blockerId: ID!) {
+                addBlockedBy(input: { issueId: $blockedId, blockingIssueId: $blockerId }) {
+                    blockingIssue { title number }
+                    issue { title number }
+                }
+            }
+QUERY
+        )" \
+        -f blockedId="$blocked_id" \
+        -f blockerId="$blocker_id" \
+        2>&1) || {
+        error "Failed to add blocking relationship: $result"
+        return 1
+    }
+
+    local blocked_title blocked_num blocker_title blocker_num
+    blocked_title=$(echo "$result" | jq -r '.data.addBlockedBy.issue.title')
+    blocked_num=$(echo "$result" | jq -r '.data.addBlockedBy.issue.number')
+    blocker_title=$(echo "$result" | jq -r '.data.addBlockedBy.blockingIssue.title')
+    blocker_num=$(echo "$result" | jq -r '.data.addBlockedBy.blockingIssue.number')
+
+    success "#$blocked_num ($blocked_title) is now blocked by #$blocker_num ($blocker_title)"
+}
+
+blocking_remove() {
+    local blocked_ref="$1"
+    local blocker_ref="$2"
+
+    info "Removing blocking relationship..."
+
+    local blocked_id blocker_id
+    blocked_id=$(get_issue_id "$blocked_ref") || return 1
+    blocker_id=$(get_issue_id "$blocker_ref") || return 1
+
+    local result
+    result=$(gh api graphql \
+        -f query="$(cat << 'QUERY'
+            mutation($blockedId: ID!, $blockerId: ID!) {
+                removeBlockedBy(input: { issueId: $blockedId, blockingIssueId: $blockerId }) {
+                    blockingIssue { title number }
+                    issue { title number }
+                }
+            }
+QUERY
+        )" \
+        -f blockedId="$blocked_id" \
+        -f blockerId="$blocker_id" \
+        2>&1) || {
+        error "Failed to remove blocking relationship: $result"
+        return 1
+    }
+
+    success "Removed blocking relationship"
+}
+
+blocking_list() {
+    local issue_ref="$1"
+    local json_output="${2:-false}"
+
+    local issue_id
+    issue_id=$(get_issue_id "$issue_ref") || return 1
+
+    local result
+    result=$(gh api graphql \
+        -f query="$(cat << 'QUERY'
+            query($issueId: ID!) {
+                node(id: $issueId) {
+                    ... on Issue {
+                        title
+                        number
+                        blockedBy(first: 50) {
+                            totalCount
+                            nodes {
+                                number
+                                title
+                                state
+                            }
+                        }
+                        blocking(first: 50) {
+                            totalCount
+                            nodes {
+                                number
+                                title
+                                state
+                            }
+                        }
+                    }
+                }
+            }
+QUERY
+        )" \
+        -f issueId="$issue_id" \
+        2>&1) || {
+        error "Failed to list blocking relationships: $result"
+        return 1
+    }
+
+    if [[ "$json_output" == "true" ]]; then
+        echo "$result" | jq '.data.node'
+        return 0
+    fi
+
+    local title num blocked_by_count blocking_count
+    title=$(echo "$result" | jq -r '.data.node.title')
+    num=$(echo "$result" | jq -r '.data.node.number')
+    blocked_by_count=$(echo "$result" | jq -r '.data.node.blockedBy.totalCount')
+    blocking_count=$(echo "$result" | jq -r '.data.node.blocking.totalCount')
+
+    echo ""
+    echo "Blocking relationships for #$num: $title"
+    echo ""
+
+    echo "Blocked by ($blocked_by_count):"
+    if [[ "$blocked_by_count" -eq 0 ]]; then
+        echo "  (none)"
+    else
+        echo "$result" | jq -r '.data.node.blockedBy.nodes[] | "  #\(.number) [\(.state)] \(.title)"'
+    fi
+
+    echo ""
+    echo "Blocking ($blocking_count):"
+    if [[ "$blocking_count" -eq 0 ]]; then
+        echo "  (none)"
+    else
+        echo "$result" | jq -r '.data.node.blocking.nodes[] | "  #\(.number) [\(.state)] \(.title)"'
+    fi
+}
+
+# ============================================================================
+# BRANCH COMMANDS
+# ============================================================================
+
+branch_create() {
+    local issue_ref="$1"
+    shift
+
+    local branch_name=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name)
+                branch_name="$2"
+                shift 2
+                ;;
+            *)
+                error "Unknown option: $1"
+                return 1
+                ;;
+        esac
+    done
+
+    info "Creating linked branch..."
+
+    local issue_id
+    issue_id=$(get_issue_id "$issue_ref") || return 1
+
+    # Get the SHA for the default branch
+    local oid
+    oid=$(gh api graphql -f query="$(cat << 'QUERY'
+        query($owner: String!, $repo: String!) {
+            repository(owner: $owner, name: $repo) {
+                defaultBranchRef {
+                    target { oid }
+                }
+            }
+        }
+QUERY
+    )" -f owner="$(gh repo view --json owner --jq '.owner.login')" \
+       -f repo="$(gh repo view --json name --jq '.name')" \
+       --jq '.data.repository.defaultBranchRef.target.oid') || {
+        error "Could not get default branch SHA"
+        return 1
+    }
+
+    local result
+    if [[ -n "$branch_name" ]]; then
+        result=$(gh api graphql \
+            -f query="$(cat << 'QUERY'
+                mutation($issueId: ID!, $oid: GitObjectID!, $name: String!) {
+                    createLinkedBranch(input: { issueId: $issueId, oid: $oid, name: $name }) {
+                        linkedBranch {
+                            ref { name prefix }
+                        }
+                        issue { title number }
+                    }
+                }
+QUERY
+            )" \
+            -f issueId="$issue_id" \
+            -f oid="$oid" \
+            -f name="$branch_name" \
+            2>&1) || {
+            error "Failed to create linked branch: $result"
+            return 1
+        }
+    else
+        result=$(gh api graphql \
+            -f query="$(cat << 'QUERY'
+                mutation($issueId: ID!, $oid: GitObjectID!) {
+                    createLinkedBranch(input: { issueId: $issueId, oid: $oid }) {
+                        linkedBranch {
+                            ref { name prefix }
+                        }
+                        issue { title number }
+                    }
+                }
+QUERY
+            )" \
+            -f issueId="$issue_id" \
+            -f oid="$oid" \
+            2>&1) || {
+            error "Failed to create linked branch: $result"
+            return 1
+        }
+    fi
+
+    local ref_name issue_num
+    ref_name=$(echo "$result" | jq -r '.data.createLinkedBranch.linkedBranch.ref.name')
+    issue_num=$(echo "$result" | jq -r '.data.createLinkedBranch.issue.number')
+
+    success "Created branch '$ref_name' linked to issue #$issue_num"
+    echo ""
+    echo "To check out the branch locally:"
+    echo "  git fetch origin && git checkout $ref_name"
+}
+
+branch_delete() {
+    local issue_ref="$1"
+    local branch_name="$2"
+
+    info "Unlinking branch..."
+
+    local issue_id
+    issue_id=$(get_issue_id "$issue_ref") || return 1
+
+    # First, find the linked branch ID
+    local branches_result
+    branches_result=$(gh api graphql \
+        -f query="$(cat << 'QUERY'
+            query($issueId: ID!) {
+                node(id: $issueId) {
+                    ... on Issue {
+                        linkedBranches(first: 50) {
+                            nodes {
+                                id
+                                ref { name }
+                            }
+                        }
+                    }
+                }
+            }
+QUERY
+        )" \
+        -f issueId="$issue_id" \
+        2>&1) || {
+        error "Failed to query linked branches: $branches_result"
+        return 1
+    }
+
+    local branch_id
+    branch_id=$(echo "$branches_result" | jq -r --arg name "$branch_name" '.data.node.linkedBranches.nodes[] | select(.ref.name == $name) | .id')
+
+    if [[ -z "$branch_id" || "$branch_id" == "null" ]]; then
+        error "Branch '$branch_name' is not linked to issue $issue_ref"
+        return 1
+    fi
+
+    local result
+    result=$(gh api graphql \
+        -f query="$(cat << 'QUERY'
+            mutation($branchId: ID!) {
+                deleteLinkedBranch(input: { linkedBranchId: $branchId }) {
+                    issue { title number }
+                }
+            }
+QUERY
+        )" \
+        -f branchId="$branch_id" \
+        2>&1) || {
+        error "Failed to unlink branch: $result"
+        return 1
+    }
+
+    success "Unlinked branch '$branch_name' from issue"
+    echo ""
+    warn "Note: The branch still exists on the remote. To delete it:"
+    echo "  git push origin --delete $branch_name"
+}
+
+branch_list() {
+    local issue_ref="$1"
+    local json_output="${2:-false}"
+
+    local issue_id
+    issue_id=$(get_issue_id "$issue_ref") || return 1
+
+    local result
+    result=$(gh api graphql \
+        -f query="$(cat << 'QUERY'
+            query($issueId: ID!) {
+                node(id: $issueId) {
+                    ... on Issue {
+                        title
+                        number
+                        linkedBranches(first: 50) {
+                            totalCount
+                            nodes {
+                                id
+                                ref {
+                                    name
+                                    prefix
+                                    target { oid }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+QUERY
+        )" \
+        -f issueId="$issue_id" \
+        2>&1) || {
+        error "Failed to list linked branches: $result"
+        return 1
+    }
+
+    if [[ "$json_output" == "true" ]]; then
+        echo "$result" | jq '.data.node'
+        return 0
+    fi
+
+    local title num count
+    title=$(echo "$result" | jq -r '.data.node.title')
+    num=$(echo "$result" | jq -r '.data.node.number')
+    count=$(echo "$result" | jq -r '.data.node.linkedBranches.totalCount')
+
+    echo ""
+    echo "Linked branches for #$num: $title"
+    echo "Total: $count"
+    echo ""
+
+    if [[ "$count" -eq 0 ]]; then
+        echo "  (no linked branches)"
+    else
+        echo "$result" | jq -r '.data.node.linkedBranches.nodes[] | "  \(.ref.name) (\(.ref.target.oid | .[0:7]))"'
+    fi
+}
+
+# ============================================================================
+# SHOW COMMAND
+# ============================================================================
+
+show_issue() {
+    local issue_ref="$1"
+    local json_output="${2:-false}"
+
+    local issue_id
+    issue_id=$(get_issue_id "$issue_ref") || return 1
+
+    local result
+    result=$(gh api graphql \
+        -H "$GRAPHQL_FEATURES_HEADER" \
+        -f query="$(cat << 'QUERY'
+            query($issueId: ID!) {
+                node(id: $issueId) {
+                    ... on Issue {
+                        title
+                        number
+                        state
+                        url
+                        parent {
+                            number
+                            title
+                            state
+                        }
+                        subIssues(first: 50) {
+                            totalCount
+                            nodes {
+                                number
+                                title
+                                state
+                            }
+                        }
+                        blockedBy(first: 50) {
+                            totalCount
+                            nodes {
+                                number
+                                title
+                                state
+                            }
+                        }
+                        blocking(first: 50) {
+                            totalCount
+                            nodes {
+                                number
+                                title
+                                state
+                            }
+                        }
+                        linkedBranches(first: 10) {
+                            totalCount
+                            nodes {
+                                ref { name }
+                            }
+                        }
+                        closedByPullRequestsReferences(first: 10) {
+                            totalCount
+                            nodes {
+                                number
+                                title
+                                state
+                            }
+                        }
+                    }
+                }
+            }
+QUERY
+        )" \
+        -f issueId="$issue_id" \
+        2>&1) || {
+        error "Failed to get issue details: $result"
+        return 1
+    }
+
+    if [[ "$json_output" == "true" ]]; then
+        echo "$result" | jq '.data.node'
+        return 0
+    fi
+
+    local title num state url
+    title=$(echo "$result" | jq -r '.data.node.title')
+    num=$(echo "$result" | jq -r '.data.node.number')
+    state=$(echo "$result" | jq -r '.data.node.state')
+    url=$(echo "$result" | jq -r '.data.node.url')
+
+    echo ""
+    echo "Issue #$num: $title"
+    echo "State: $state"
+    echo "URL: $url"
+    echo ""
+
+    # Parent
+    local parent_num parent_title
+    parent_num=$(echo "$result" | jq -r '.data.node.parent.number // empty')
+    if [[ -n "$parent_num" ]]; then
+        parent_title=$(echo "$result" | jq -r '.data.node.parent.title')
+        echo "Parent: #$parent_num - $parent_title"
+        echo ""
+    fi
+
+    # Sub-issues
+    local sub_count
+    sub_count=$(echo "$result" | jq -r '.data.node.subIssues.totalCount')
+    echo "Sub-issues ($sub_count):"
+    if [[ "$sub_count" -eq 0 ]]; then
+        echo "  (none)"
+    else
+        echo "$result" | jq -r '.data.node.subIssues.nodes[] | "  #\(.number) [\(.state)] \(.title)"'
+    fi
+    echo ""
+
+    # Blocking relationships
+    local blocked_by_count blocking_count
+    blocked_by_count=$(echo "$result" | jq -r '.data.node.blockedBy.totalCount')
+    blocking_count=$(echo "$result" | jq -r '.data.node.blocking.totalCount')
+
+    echo "Blocked by ($blocked_by_count):"
+    if [[ "$blocked_by_count" -eq 0 ]]; then
+        echo "  (none)"
+    else
+        echo "$result" | jq -r '.data.node.blockedBy.nodes[] | "  #\(.number) [\(.state)] \(.title)"'
+    fi
+    echo ""
+
+    echo "Blocking ($blocking_count):"
+    if [[ "$blocking_count" -eq 0 ]]; then
+        echo "  (none)"
+    else
+        echo "$result" | jq -r '.data.node.blocking.nodes[] | "  #\(.number) [\(.state)] \(.title)"'
+    fi
+    echo ""
+
+    # Linked branches
+    local branch_count
+    branch_count=$(echo "$result" | jq -r '.data.node.linkedBranches.totalCount')
+    echo "Linked branches ($branch_count):"
+    if [[ "$branch_count" -eq 0 ]]; then
+        echo "  (none)"
+    else
+        echo "$result" | jq -r '.data.node.linkedBranches.nodes[] | "  \(.ref.name)"'
+    fi
+    echo ""
+
+    # PRs
+    local pr_count
+    pr_count=$(echo "$result" | jq -r '.data.node.closedByPullRequestsReferences.totalCount')
+    echo "Linked PRs ($pr_count):"
+    if [[ "$pr_count" -eq 0 ]]; then
+        echo "  (none)"
+    else
+        echo "$result" | jq -r '.data.node.closedByPullRequestsReferences.nodes[] | "  #\(.number) [\(.state)] \(.title)"'
+    fi
+}
+
+# ============================================================================
+# MAIN COMMAND DISPATCH
+# ============================================================================
+
+main() {
+    if [[ $# -eq 0 ]]; then
+        usage
+        exit 0
+    fi
+
+    local json_output="false"
+    local args=()
+
+    # Pre-process for global flags
+    for arg in "$@"; do
+        case "$arg" in
+            --json)
+                json_output="true"
+                ;;
+            *)
+                args+=("$arg")
+                ;;
+        esac
+    done
+
+    set -- "${args[@]}"
+
+    case "$1" in
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        --version|-v)
+            echo "gh-issue-ext version $VERSION"
+            exit 0
+            ;;
+        sub)
+            shift
+            if [[ $# -eq 0 ]]; then
+                error "Missing subcommand. Use: add, remove, list, reorder"
+                exit 1
+            fi
+            case "$1" in
+                add)
+                    shift
+                    [[ $# -lt 2 ]] && { error "Usage: gh issue-ext sub add <parent> <child>"; exit 1; }
+                    sub_add "$@"
+                    ;;
+                remove)
+                    shift
+                    [[ $# -lt 2 ]] && { error "Usage: gh issue-ext sub remove <parent> <child>"; exit 1; }
+                    sub_remove "$@"
+                    ;;
+                list)
+                    shift
+                    [[ $# -lt 1 ]] && { error "Usage: gh issue-ext sub list <issue>"; exit 1; }
+                    sub_list "$1" "$json_output"
+                    ;;
+                reorder)
+                    shift
+                    [[ $# -lt 2 ]] && { error "Usage: gh issue-ext sub reorder <parent> <child> --after|--before <sibling>"; exit 1; }
+                    sub_reorder "$@"
+                    ;;
+                *)
+                    error "Unknown sub command: $1"
+                    exit 1
+                    ;;
+            esac
+            ;;
+        blocking)
+            shift
+            if [[ $# -eq 0 ]]; then
+                error "Missing subcommand. Use: add, remove, list"
+                exit 1
+            fi
+            case "$1" in
+                add)
+                    shift
+                    [[ $# -lt 2 ]] && { error "Usage: gh issue-ext blocking add <blocked> <blocker>"; exit 1; }
+                    blocking_add "$@"
+                    ;;
+                remove)
+                    shift
+                    [[ $# -lt 2 ]] && { error "Usage: gh issue-ext blocking remove <blocked> <blocker>"; exit 1; }
+                    blocking_remove "$@"
+                    ;;
+                list)
+                    shift
+                    [[ $# -lt 1 ]] && { error "Usage: gh issue-ext blocking list <issue>"; exit 1; }
+                    blocking_list "$1" "$json_output"
+                    ;;
+                *)
+                    error "Unknown blocking command: $1"
+                    exit 1
+                    ;;
+            esac
+            ;;
+        branch)
+            shift
+            if [[ $# -eq 0 ]]; then
+                error "Missing subcommand. Use: create, delete, list"
+                exit 1
+            fi
+            case "$1" in
+                create)
+                    shift
+                    [[ $# -lt 1 ]] && { error "Usage: gh issue-ext branch create <issue> [--name <branch-name>]"; exit 1; }
+                    branch_create "$@"
+                    ;;
+                delete)
+                    shift
+                    [[ $# -lt 2 ]] && { error "Usage: gh issue-ext branch delete <issue> <branch-name>"; exit 1; }
+                    branch_delete "$@"
+                    ;;
+                list)
+                    shift
+                    [[ $# -lt 1 ]] && { error "Usage: gh issue-ext branch list <issue>"; exit 1; }
+                    branch_list "$1" "$json_output"
+                    ;;
+                *)
+                    error "Unknown branch command: $1"
+                    exit 1
+                    ;;
+            esac
+            ;;
+        show)
+            shift
+            [[ $# -lt 1 ]] && { error "Usage: gh issue-ext show <issue>"; exit 1; }
+            show_issue "$1" "$json_output"
+            ;;
+        *)
+            error "Unknown command: $1"
+            echo ""
+            usage
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
